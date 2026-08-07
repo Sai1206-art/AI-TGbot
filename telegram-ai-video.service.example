@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram AI media bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/telegram-ai-video-demo
+EnvironmentFile=/etc/telegram-ai-video-bot.env
+ExecStart=/opt/telegram-ai-video-demo/.venv/bin/python telegram_bot.py
+Restart=always
+RestartSec=10
+User=telegrambot
+UMask=027
+
+[Install]
+WantedBy=multi-user.target
