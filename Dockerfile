@@ -10,5 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY telegram_bot.py wallet.py README.md ./
 RUN mkdir -p /app/data
 
-VOLUME ["/app/data"]
 CMD ["python", "telegram_bot.py"]
