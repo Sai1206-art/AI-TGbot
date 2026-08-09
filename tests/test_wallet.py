@@ -156,6 +156,67 @@ class WalletStoreTests(unittest.TestCase):
         self.store.refund_generation(6, reservation, mode="video", error="dead-letter")
         self.assertEqual(self.store.get_balance(6)["balance"], 10)
 
+    def test_rate_limit_is_durable(self) -> None:
+        self.assertTrue(self.store.allow_request(7, max_requests=2, window_seconds=60))
+        self.assertTrue(self.store.allow_request(7, max_requests=2, window_seconds=60))
+        self.assertFalse(self.store.allow_request(7, max_requests=2, window_seconds=60))
+        reopened = WalletStore(self.store.database_path)
+        self.assertFalse(reopened.allow_request(7, max_requests=2, window_seconds=60))
+
+    def test_claim_allows_only_one_active_job_per_user(self) -> None:
+        self.store.add_payment(
+            user_id=8,
+            telegram_payment_charge_id="charge-order",
+            provider_payment_charge_id=None,
+            payload="tokens:30:stars:30",
+            credits=30,
+            stars=30,
+        )
+        jobs = []
+        for message_id in (1, 2):
+            reservation = self.store.reserve_generation(
+                8, mode="video", cost=10, allow_free=False,
+                request_key=f"photo:8:{message_id}",
+            )
+            jobs.append(self.store.enqueue_generation_job(
+                request_key=f"photo:8:{message_id}", user_id=8, chat_id=8,
+                message_id=message_id, reservation_id=reservation["reservation_id"],
+                kind=reservation["kind"], cost=reservation["cost"], mode="video",
+                prompt="test", file_id=f"file-{message_id}",
+            ))
+        first = self.store.claim_next_generation_job(max_attempts=3)
+        self.assertEqual(first["message_id"], 1)
+        self.assertIsNone(self.store.claim_next_generation_job(max_attempts=3))
+        self.store.finish_generation_job(first["job_id"])
+        second = self.store.claim_next_generation_job(max_attempts=3)
+        self.assertEqual(second["message_id"], 2)
+
+    def test_stale_running_job_is_requeued(self) -> None:
+        self.store.add_payment(
+            user_id=9,
+            telegram_payment_charge_id="charge-stale",
+            provider_payment_charge_id=None,
+            payload="tokens:10:stars:10",
+            credits=10,
+            stars=10,
+        )
+        reservation = self.store.reserve_generation(
+            9, mode="video", cost=10, allow_free=False, request_key="photo:9:1"
+        )
+        self.store.enqueue_generation_job(
+            request_key="photo:9:1", user_id=9, chat_id=9, message_id=1,
+            reservation_id=reservation["reservation_id"], kind=reservation["kind"],
+            cost=reservation["cost"], mode="video", prompt="test", file_id="file",
+        )
+        claimed = self.store.claim_next_generation_job(max_attempts=3)
+        with self.store._connect() as connection:
+            connection.execute(
+                "UPDATE generation_jobs SET claimed_at = ? WHERE job_id = ?",
+                ("2000-01-01T00:00:00+00:00", claimed["job_id"]),
+            )
+        self.assertEqual(self.store.recover_stale_jobs(max_age_seconds=1), 1)
+        self.assertEqual(self.store.get_job_counts()["queued"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

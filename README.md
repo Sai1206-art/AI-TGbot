@@ -2,7 +2,7 @@
 
 This is a very small demo bot. A user chooses Video or Image Edit, sends a photo, and receives the generated result from your Hugging Face Space.
 
-It uses webhook delivery when `WEBHOOK_URL` is configured, SQLite wallets/jobs, and Telegram Stars payments. Every user gets one free Image Edit generation; Video requires paid tokens from the first request and costs three tokens by default.
+It uses webhook delivery when `WEBHOOK_URL` is configured, SQLite wallets/jobs, and Telegram Stars payments. Every user gets one free Image Edit generation; paid Image Edit costs 2 Stars and Video costs 10 Stars by default.
 
 ## Important: protect your token
 
@@ -75,6 +75,10 @@ export RATE_LIMIT_REQUESTS="3"
 export RATE_LIMIT_WINDOW_SECONDS="60"
 export JOB_MAX_ATTEMPTS="3"
 export JOB_POLL_SECONDS="2"
+export JOB_RETRY_BASE_SECONDS="15"
+export JOB_RUNNING_STALE_SECONDS="1800"
+export JOB_WORKERS="1"
+export JOB_GLOBAL_CONCURRENCY="1"
 
 For Railway or another public host, configure webhook delivery so Telegram sends updates to exactly one active instance per bot token:
 
@@ -115,17 +119,17 @@ You should see `Bot is running`. Leave this Terminal window open while testing.
 
 ### Tokens and Telegram Stars
 
-Each Telegram user receives one free Image Edit generation. Video never uses the free credit and costs three paid tokens by default; Image Edit costs one paid token after the free generation. Set `IMAGE_EDIT_COST` and `VIDEO_COST` to change the per-mode costs. After a purchase and after each successful generation, the bot shows the remaining paid balance and mode-specific affordable generations. Use `/balance` to see the free-credit status, paid balance, and recent history; `/history` shows up to ten recent requests; `/buy` chooses a 10-, 30-, or 75-token package paid with Telegram Stars (XTR). `/support` and `/paysupport` tell users where to request help, and `/language` records the current language selection.
+Each Telegram user receives one free Image Edit generation. Video never uses the free credit and costs 10 paid Stars by default; Image Edit costs 2 paid Stars after the free generation. These higher defaults leave more headroom for GPU time, retries, storage, and platform overhead; review measured costs before changing them. Set `IMAGE_EDIT_COST` and `VIDEO_COST` to override them. After a purchase and after each successful generation, the bot shows the remaining paid balance and mode-specific affordable generations. Use `/balance` to see the free-credit status, paid balance, and recent history; `/history` shows up to ten recent requests; `/buy` chooses a 10-, 30-, or 75-token package paid with Telegram Stars (XTR). `/support` and `/paysupport` tell users where to request help, and `/language` records the current language selection.
 
 The bot approves valid pre-checkout queries, credits tokens only after Telegram sends a successful payment update, and stores the Telegram charge ID in SQLite for duplicate-payment protection. The mode-specific free credit or exact paid token cost is reserved atomically before any generation, logged in `wallet_events`, and automatically refunded exactly once if the Hugging Face Space fails or times out. Successful and failed requests are stored in `generation_history`; stale reservations are recovered at startup after `RESERVATION_MAX_AGE_SECONDS`.
 
-The SQLite database defaults to `bot_data.sqlite3` in the project folder. Set `WALLET_DB_PATH` to move it. Package amounts currently use a simple 1 Star = 1 token demo price; review your GPU cost and change the package pricing before launch.
+The SQLite database defaults to `bot_data.sqlite3` in the project folder. Set `WALLET_DB_PATH` to move it. Package amounts currently use a simple 1 Star = 1 token demo price; generation costs are 2 tokens for Image Edit and 10 tokens for Video by default.
 
 Manual payment test plan:
 
 1. New user sends `/start`, selects Image Edit, and sends one photo: it succeeds as the free generation.
 2. New user selects Video with zero paid balance: the bot blocks it and shows the Buy Tokens menu.
-3. The user buys the 10-token package with Telegram Stars, then sends a video photo: payment confirmation increases the balance and the generation deducts three tokens.
+3. The user buys the 10-token package with Telegram Stars, then sends a video photo: payment confirmation increases the balance and the generation deducts ten tokens.
 
 To stop the bot, click the Terminal window and press `Control+C`.
 
@@ -137,7 +141,7 @@ Run the wallet and concurrency scenarios with:
 ./.venv/bin/python -m unittest discover -s tests -v
 ```
 
-The checklist in `TEST_CHECKLIST.md` covers free usage, payment idempotency, insufficient balance, concurrent requests, failure refunds, restart recovery, and startup configuration errors.
+The checklist in `TEST_CHECKLIST.md` covers free usage, payment idempotency, insufficient balance, durable rate limits, per-user ordering, concurrent requests, failure refunds, restart recovery, and startup configuration errors.
 
 ## Unattended deployment
 

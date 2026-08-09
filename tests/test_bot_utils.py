@@ -19,8 +19,8 @@ class BotUtilsTests(unittest.TestCase):
     def test_mode_instructions_are_specific(self) -> None:
         self.assertIn("photo caption", mode_instruction("image_edit"))
         self.assertIn("without a caption", mode_instruction("video"))
-        self.assertEqual(mode_cost("image_edit"), 1)
-        self.assertEqual(mode_cost("video"), 3)
+        self.assertEqual(mode_cost("image_edit"), 2)
+        self.assertEqual(mode_cost("video"), 10)
         self.assertIn("video generation(s)", format_balance_summary({"balance": 6}, "video"))
 
 

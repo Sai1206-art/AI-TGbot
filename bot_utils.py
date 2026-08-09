@@ -10,7 +10,7 @@ VIDEO_MODE = "video"
 
 def mode_cost(mode: str) -> int:
     variable = "VIDEO_COST" if mode == VIDEO_MODE else "IMAGE_EDIT_COST"
-    default = "3" if mode == VIDEO_MODE else "1"
+    default = "10" if mode == VIDEO_MODE else "2"
     return max(1, int(os.getenv(variable, default)))
 
 
@@ -30,14 +30,14 @@ def format_balance_summary(balance: dict[str, Any], mode: str | None = None) -> 
     if mode == VIDEO_MODE:
         cost = mode_cost(mode)
         affordable = paid_tokens // cost
-        return f"You have {paid_tokens} paid token(s) remaining ({affordable} video generation(s) at {cost} tokens each)."
+        return f"You have {paid_tokens} paid Star(s) remaining ({affordable} video generation(s) at {cost} Stars each)."
     if mode == IMAGE_EDIT_MODE:
         total = paid_tokens + int(bool(free_available))
-        return f"You have {total} Image Edit generation(s) remaining ({paid_tokens} paid token(s); free generation {free_text})."
-    return f"You have {paid_tokens} paid token(s) remaining; free Image Edit generation {free_text}."
+        return f"You have {total} Image Edit generation(s) remaining ({paid_tokens} paid Star(s); free generation {free_text})."
+    return f"You have {paid_tokens} paid Star(s) remaining; free Image Edit generation {free_text}."
 
 
 def mode_instruction(mode: str) -> str:
     if mode == "image_edit":
-        return f"For Image Edit, write your edit prompt in the photo caption. Cost: {mode_cost(mode)} token."
-    return f"For Video, send the photo without a caption; the configured video prompt is used. Cost: {mode_cost(mode)} paid tokens per video."
+        return f"For Image Edit, write your edit prompt in the photo caption. Cost: {mode_cost(mode)} Stars."
+    return f"For Video, send the photo without a caption; the configured video prompt is used. Cost: {mode_cost(mode)} paid Stars per video."

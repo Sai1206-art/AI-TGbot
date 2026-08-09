@@ -14,6 +14,9 @@ Covered scenarios:
 - Successful payments credit tokens only once for a repeated Telegram charge ID.
 - Concurrent requests cannot spend the same free credit or paid token twice.
 - Successful and failed requests appear in generation history.
+- Rate limits are enforced from SQLite, not process memory, so they survive restarts.
+- Only one job per user runs at a time; jobs from the same user remain ordered.
+- Jobs left running by a crashed worker are requeued after the lease timeout.
 
 Manual Telegram checks:
 

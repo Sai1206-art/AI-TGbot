@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import time
-from collections import defaultdict, deque
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -47,7 +46,7 @@ MODE_KEYBOARD = [[VIDEO_BUTTON, IMAGE_EDIT_BUTTON], [BALANCE_BUTTON, SUPPORT_BUT
 PACKAGE_CREDITS = (10, 30, 75)
 WALLET_DB_PATH = os.getenv("WALLET_DB_PATH", "bot_data.sqlite3")
 wallet_store = WalletStore(WALLET_DB_PATH)
-_rate_limit_events: dict[int, deque[float]] = defaultdict(deque)
+_worker_semaphore: asyncio.Semaphore | None = None
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -623,16 +622,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = _ensure_user(update)
     if user_id is None:
         return
-    now = time.monotonic()
     window_seconds = max(1, int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")))
     max_requests = max(1, int(os.getenv("RATE_LIMIT_REQUESTS", "3")))
-    events = _rate_limit_events[user_id]
-    while events and now - events[0] >= window_seconds:
-        events.popleft()
-    if len(events) >= max_requests:
+    allowed = await asyncio.to_thread(
+        wallet_store.allow_request,
+        user_id,
+        max_requests=max_requests,
+        window_seconds=window_seconds,
+    )
+    if not allowed:
         await update.message.reply_text("You are sending requests too quickly. Please wait a moment and try again.")
         return
-    events.append(now)
 
     mode = _mode_for_chat(context)
     prompt = _get_image_prompt(update) if mode == IMAGE_EDIT_MODE else os.getenv("HF_PROMPT", DEFAULT_PROMPT)
@@ -677,6 +677,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def _process_generation_job(application: Application, job: dict[str, Any]) -> None:
     bot = application.bot
+    started_at = time.monotonic()
     user_id = job["user_id"]
     mode = job["mode"]
     reservation = {
@@ -722,23 +723,42 @@ async def _process_generation_job(application: Application, job: dict[str, Any])
             wallet_store.finish_generation_job(job["job_id"])
             balance = wallet_store.get_balance(user_id)
             await bot.send_message(chat_id=job["chat_id"], text=format_balance_summary(balance, mode))
+            logger.info(
+                "Generation job completed: job_id=%s mode=%s attempt=%s latency_seconds=%.2f",
+                job["job_id"], mode, job.get("attempts", 1), time.monotonic() - started_at,
+            )
+    except asyncio.CancelledError:
+        wallet_store.release_running_job(job["job_id"])
+        raise
     except asyncio.TimeoutError:
+        attempts = int(job.get("attempts", 1))
+        retry_delay = max(1, int(os.getenv("JOB_RETRY_BASE_SECONDS", "15"))) * (2 ** max(0, attempts - 1))
         status = wallet_store.finish_generation_job(
-            job["job_id"], failed=True, error="timeout", retry_delay_seconds=15,
+            job["job_id"], failed=True, error="timeout", retry_delay_seconds=retry_delay,
             max_attempts=int(os.getenv("JOB_MAX_ATTEMPTS", "3")),
         )
         if status == "dead_letter":
             balance = wallet_store.refund_generation(user_id, reservation, mode=mode, error="timeout")
             await bot.send_message(chat_id=job["chat_id"], text="The generation timed out after retries. Your credit was restored. " + format_balance_summary(balance, mode))
+        logger.warning(
+            "Generation job timeout: job_id=%s status=%s latency_seconds=%.2f",
+            job["job_id"], status, time.monotonic() - started_at,
+        )
     except Exception:
+        attempts = int(job.get("attempts", 1))
+        retry_delay = max(1, int(os.getenv("JOB_RETRY_BASE_SECONDS", "15"))) * (2 ** max(0, attempts - 1))
         status = wallet_store.finish_generation_job(
-            job["job_id"], failed=True, error="upstream failure", retry_delay_seconds=15,
+            job["job_id"], failed=True, error="upstream failure", retry_delay_seconds=retry_delay,
             max_attempts=int(os.getenv("JOB_MAX_ATTEMPTS", "3")),
         )
         logger.exception("Generation job failed: job_id=%s status=%s", job["job_id"], status)
         if status == "dead_letter":
             balance = wallet_store.refund_generation(user_id, reservation, mode=mode, error="upstream failure")
             await bot.send_message(chat_id=job["chat_id"], text="I couldn’t complete this after retries. Your credit was restored. " + format_balance_summary(balance, mode))
+        logger.warning(
+            "Generation job failed: job_id=%s status=%s latency_seconds=%.2f",
+            job["job_id"], status, time.monotonic() - started_at,
+        )
 
 
 async def _generation_worker(application: Application) -> None:
@@ -749,22 +769,39 @@ async def _generation_worker(application: Application) -> None:
             wallet_store.claim_next_generation_job, max_attempts=max_attempts
         )
         if job:
-            await _process_generation_job(application, job)
+            if _worker_semaphore is None:
+                await _process_generation_job(application, job)
+            else:
+                async with _worker_semaphore:
+                    await _process_generation_job(application, job)
         else:
-            counts = await asyncio.to_thread(wallet_store.get_job_counts)
-            logger.info("Generation queue health: %s", counts)
+            metrics = await asyncio.to_thread(wallet_store.get_queue_metrics)
+            logger.info("Generation queue health: %s", metrics)
             await asyncio.sleep(poll_seconds)
 
 
 async def _post_init(application: Application) -> None:
-    application.bot_data["generation_worker"] = asyncio.create_task(_generation_worker(application))
+    recovered = await asyncio.to_thread(
+        wallet_store.recover_stale_jobs,
+        max_age_seconds=int(os.getenv("JOB_RUNNING_STALE_SECONDS", "1800")),
+        max_attempts=max(1, int(os.getenv("JOB_MAX_ATTEMPTS", "3"))),
+    )
+    if recovered:
+        logger.warning("Requeued stale running jobs: count=%s", recovered)
+    global _worker_semaphore
+    _worker_semaphore = asyncio.Semaphore(max(1, int(os.getenv("JOB_GLOBAL_CONCURRENCY", "1"))))
+    worker_count = max(1, int(os.getenv("JOB_WORKERS", "1")))
+    application.bot_data["generation_workers"] = [
+        asyncio.create_task(_generation_worker(application)) for _ in range(worker_count)
+    ]
 
 
 async def _post_shutdown(application: Application) -> None:
-    worker = application.bot_data.pop("generation_worker", None)
-    if worker:
+    workers = application.bot_data.pop("generation_workers", [])
+    for worker in workers:
         worker.cancel()
-        await asyncio.gather(worker, return_exceptions=True)
+    if workers:
+        await asyncio.gather(*workers, return_exceptions=True)
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

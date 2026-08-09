@@ -100,6 +100,13 @@ class WalletStore:
                 );
                 CREATE INDEX IF NOT EXISTS generation_jobs_ready_idx
                     ON generation_jobs(status, available_at, created_at);
+                CREATE TABLE IF NOT EXISTS request_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS request_events_user_time_idx
+                    ON request_events(user_id, created_at);
                 CREATE TABLE IF NOT EXISTS generation_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -316,15 +323,40 @@ class WalletStore:
             ).fetchone()
         return dict(row)
 
+    def allow_request(self, user_id: int, *, max_requests: int, window_seconds: int) -> bool:
+        """Atomically enforce a durable per-user request rate limit."""
+        timestamp = self._timestamp()
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "DELETE FROM request_events WHERE user_id = ? AND created_at < ?",
+                (user_id, cutoff.isoformat()),
+            )
+            count = connection.execute(
+                "SELECT COUNT(*) FROM request_events WHERE user_id = ?", (user_id,)
+            ).fetchone()[0]
+            if count >= max_requests:
+                return False
+            connection.execute(
+                "INSERT INTO request_events(user_id, created_at) VALUES (?, ?)",
+                (user_id, timestamp),
+            )
+        return True
+
     def claim_next_generation_job(self, *, max_attempts: int = 3) -> dict[str, Any] | None:
         timestamp = self._timestamp()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT * FROM generation_jobs
-                WHERE status = 'queued' AND attempts < ? AND available_at <= ?
-                ORDER BY created_at LIMIT 1
+                SELECT job.* FROM generation_jobs AS job
+                WHERE job.status = 'queued' AND job.attempts < ? AND job.available_at <= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM generation_jobs AS active
+                      WHERE active.user_id = job.user_id AND active.status = 'running'
+                  )
+                ORDER BY job.created_at LIMIT 1
                 """,
                 (max_attempts, timestamp),
             ).fetchone()
@@ -340,6 +372,45 @@ class WalletStore:
                 "SELECT * FROM generation_jobs WHERE job_id = ?", (row["job_id"],)
             ).fetchone()
         return dict(row)
+
+    def recover_stale_jobs(self, *, max_age_seconds: int = 1800, max_attempts: int = 3) -> int:
+        """Requeue jobs left running by a crashed worker."""
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        timestamp = self._timestamp()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT job_id, attempts FROM generation_jobs
+                WHERE status = 'running' AND claimed_at < ?
+                """,
+                (cutoff.isoformat(),),
+            ).fetchall()
+            for row in rows:
+                status = "dead_letter" if row["attempts"] >= max_attempts else "queued"
+                connection.execute(
+                    """
+                    UPDATE generation_jobs
+                    SET status = ?, available_at = ?, claimed_at = NULL,
+                        last_error = 'worker lease expired', updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (status, timestamp, timestamp, row["job_id"]),
+                )
+            return len(rows)
+
+    def release_running_job(self, job_id: str, *, error: str = "worker cancelled") -> bool:
+        timestamp = self._timestamp()
+        with self._connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE generation_jobs
+                SET status = 'queued', available_at = ?, claimed_at = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE job_id = ? AND status = 'running'
+                """,
+                (timestamp, error, timestamp, job_id),
+            ).rowcount
+        return bool(updated)
 
     def finish_generation_job(
         self,
@@ -382,6 +453,36 @@ class WalletStore:
                 "SELECT status, COUNT(*) AS count FROM generation_jobs GROUP BY status"
             ).fetchall()
         return {row["status"]: row["count"] for row in rows}
+
+    def get_queue_metrics(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        with self._connect() as connection:
+            counts = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM generation_jobs GROUP BY status"
+            ).fetchall()
+            oldest = connection.execute(
+                "SELECT MIN(created_at) FROM generation_jobs WHERE status = 'queued'"
+            ).fetchone()[0]
+            running = connection.execute(
+                "SELECT MIN(claimed_at) FROM generation_jobs WHERE status = 'running'"
+            ).fetchone()[0]
+            history = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM generation_history GROUP BY status"
+            ).fetchall()
+        age = 0.0
+        if oldest:
+            age = max(0.0, (now - datetime.fromisoformat(oldest)).total_seconds())
+        running_age = 0.0
+        if running:
+            running_age = max(0.0, (now - datetime.fromisoformat(running)).total_seconds())
+        history_counts = {row["status"]: row["count"] for row in history}
+        return {
+            "counts": {row["status"]: row["count"] for row in counts},
+            "oldest_queued_age_seconds": round(age, 2),
+            "oldest_running_age_seconds": round(running_age, 2),
+            "success_count": history_counts.get("succeeded", 0),
+            "failure_count": history_counts.get("failed", 0),
+        }
 
     def complete_generation(
         self,
