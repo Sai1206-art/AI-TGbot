@@ -89,6 +89,7 @@ class WalletStore:
                     cost INTEGER NOT NULL,
                     mode TEXT NOT NULL,
                     prompt TEXT,
+                    caption_provided INTEGER NOT NULL DEFAULT 0,
                     file_id TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'queued',
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +129,11 @@ class WalletStore:
                 connection.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS generation_reservations_request_key_idx "
                     "ON generation_reservations(request_key) WHERE request_key IS NOT NULL"
+                )
+            job_columns = {row[1] for row in connection.execute("PRAGMA table_info(generation_jobs)")}
+            if "caption_provided" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE generation_jobs ADD COLUMN caption_provided INTEGER NOT NULL DEFAULT 0"
                 )
 
     def _ensure_user_in(self, connection: sqlite3.Connection, user_id: int, timestamp: str) -> None:
@@ -304,6 +310,7 @@ class WalletStore:
         mode: str,
         prompt: str,
         file_id: str,
+        caption_provided: bool = False,
     ) -> dict[str, Any]:
         timestamp = self._timestamp()
         job_id = uuid.uuid4().hex
@@ -312,11 +319,12 @@ class WalletStore:
                 """
                 INSERT OR IGNORE INTO generation_jobs
                     (job_id, request_key, user_id, chat_id, message_id, reservation_id,
-                     kind, cost, mode, prompt, file_id, status, available_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                    kind, cost, mode, prompt, caption_provided, file_id, status,
+                    available_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
                 """,
                 (job_id, request_key, user_id, chat_id, message_id, reservation_id, kind, cost,
-                 mode, prompt, file_id, timestamp, timestamp, timestamp),
+                 mode, prompt, int(caption_provided), file_id, timestamp, timestamp, timestamp),
             )
             row = connection.execute(
                 "SELECT * FROM generation_jobs WHERE request_key = ?", (request_key,)

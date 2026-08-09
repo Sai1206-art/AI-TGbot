@@ -635,7 +635,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     mode = _mode_for_chat(context)
-    prompt = _get_image_prompt(update) if mode == IMAGE_EDIT_MODE else os.getenv("HF_PROMPT", DEFAULT_PROMPT)
+    caption = (update.message.caption or "").strip()
+    if mode == IMAGE_EDIT_MODE:
+        prompt = caption or os.getenv("HF_IMAGE_PROMPT", DEFAULT_IMAGE_EDIT_PROMPT)
+    else:
+        prompt = os.getenv("HF_PROMPT", DEFAULT_PROMPT)
     cost = mode_cost(mode)
     request_key = f"photo:{update.message.chat_id}:{update.message.message_id}"
     reservation = wallet_store.reserve_generation(
@@ -666,6 +670,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         cost=reservation["cost"],
         mode=mode,
         prompt=prompt,
+        caption_provided=bool(caption) if mode == IMAGE_EDIT_MODE else False,
         file_id=update.message.photo[-1].file_id,
     )
     if reservation["kind"] == "free" and reservation["status"] == "reserved":
@@ -704,6 +709,11 @@ async def _process_generation_job(application: Application, job: dict[str, Any])
                         chat_id=job["chat_id"],
                         photo=image_file,
                         caption="Here is your edited image.",
+                    )
+                if not job.get("caption_provided"):
+                    await bot.send_message(
+                        chat_id=job["chat_id"],
+                        text="If the result is not as expected, try again with a caption describing the edit you want.",
                     )
             else:
                 generated_path = await asyncio.wait_for(
