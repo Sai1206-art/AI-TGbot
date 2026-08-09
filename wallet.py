@@ -60,6 +60,7 @@ class WalletStore:
                     reservation_id TEXT PRIMARY KEY,
                     user_id INTEGER NOT NULL,
                     kind TEXT NOT NULL,
+                    cost INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL,
                     mode TEXT,
                     prompt TEXT,
@@ -79,6 +80,9 @@ class WalletStore:
                 );
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(generation_reservations)")}
+            if "cost" not in columns:
+                connection.execute("ALTER TABLE generation_reservations ADD COLUMN cost INTEGER NOT NULL DEFAULT 1")
 
     def _ensure_user_in(self, connection: sqlite3.Connection, user_id: int, timestamp: str) -> None:
         connection.execute(
@@ -157,8 +161,16 @@ class WalletStore:
         return [dict(row) for row in rows]
 
     def reserve_generation(
-        self, user_id: int, *, mode: str | None = None, prompt: str | None = None
+        self,
+        user_id: int,
+        *,
+        mode: str | None = None,
+        prompt: str | None = None,
+        cost: int = 1,
+        allow_free: bool = True,
     ) -> dict[str, Any] | None:
+        if cost < 1:
+            raise ValueError("Generation cost must be at least 1 token.")
         timestamp = self._timestamp()
         reservation_id = uuid.uuid4().hex
         with self._connect() as connection:
@@ -168,7 +180,7 @@ class WalletStore:
                 "SELECT free_credit_used, balance FROM wallets WHERE user_id = ?",
                 (user_id,),
             ).fetchone()
-            if row["free_credit_used"] == 0:
+            if allow_free and row["free_credit_used"] == 0:
                 kind = "free"
                 new_balance = row["balance"]
                 free_used = 1
@@ -176,9 +188,9 @@ class WalletStore:
                     "UPDATE wallets SET free_credit_used = 1, updated_at = ? WHERE user_id = ?",
                     (timestamp, user_id),
                 )
-            elif row["balance"] > 0:
+            elif row["balance"] >= cost:
                 kind = "paid"
-                new_balance = row["balance"] - 1
+                new_balance = row["balance"] - cost
                 free_used = row["free_credit_used"]
                 connection.execute(
                     "UPDATE wallets SET balance = ?, updated_at = ? WHERE user_id = ?",
@@ -189,16 +201,16 @@ class WalletStore:
             connection.execute(
                 """
                 INSERT INTO generation_reservations
-                    (reservation_id, user_id, kind, status, mode, prompt, created_at, updated_at)
-                VALUES (?, ?, ?, 'reserved', ?, ?, ?, ?)
+                    (reservation_id, user_id, kind, cost, status, mode, prompt, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?)
                 """,
-                (reservation_id, user_id, kind, mode, prompt, timestamp, timestamp),
+                (reservation_id, user_id, kind, cost, mode, prompt, timestamp, timestamp),
             )
             self._record_event(
                 connection,
                 user_id=user_id,
                 event_type="generation_reserved",
-                amount=-1,
+                amount=-cost if kind == "paid" else 0,
                 balance_after=new_balance,
                 free_credit_used_after=free_used,
                 timestamp=timestamp,
@@ -208,6 +220,7 @@ class WalletStore:
         return {
             "reservation_id": reservation_id,
             "kind": kind,
+            "cost": cost if kind == "paid" else 0,
             "balance": new_balance,
             "free_credit_used": free_used,
         }
@@ -269,8 +282,8 @@ class WalletStore:
                     )
                 else:
                     connection.execute(
-                        "UPDATE wallets SET balance = balance + 1, updated_at = ? WHERE user_id = ?",
-                        (timestamp, user_id),
+                        "UPDATE wallets SET balance = balance + ?, updated_at = ? WHERE user_id = ?",
+                        (reservation.get("cost", 1), timestamp, user_id),
                     )
                 row = connection.execute(
                     "SELECT free_credit_used, balance FROM wallets WHERE user_id = ?",
@@ -280,7 +293,7 @@ class WalletStore:
                     connection,
                     user_id=user_id,
                     event_type="generation_refunded",
-                    amount=1,
+                    amount=reservation.get("cost", 1) if reservation["kind"] == "paid" else 0,
                     balance_after=row["balance"],
                     free_credit_used_after=row["free_credit_used"],
                     timestamp=timestamp,
@@ -307,7 +320,7 @@ class WalletStore:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT reservation_id, user_id, kind FROM generation_reservations
+                SELECT reservation_id, user_id, kind, cost FROM generation_reservations
                 WHERE status = 'reserved' AND created_at < ?
                 """,
                 (cutoff.isoformat(),),
@@ -316,7 +329,7 @@ class WalletStore:
         for row in rows:
             self.refund_generation(
                 row["user_id"],
-                {"reservation_id": row["reservation_id"], "kind": row["kind"]},
+                {"reservation_id": row["reservation_id"], "kind": row["kind"], "cost": row["cost"]},
                 error="stale reservation recovered",
             )
             released += 1

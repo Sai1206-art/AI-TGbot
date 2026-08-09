@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 
 from wallet import WalletStore
-from bot_utils import format_balance_summary, mode_instruction
+from bot_utils import format_balance_summary, mode_cost, mode_instruction
 
 
 DEFAULT_PROMPT = "Animate this image with natural, cinematic motion."
@@ -83,8 +83,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         _ensure_user(update)
         await update.message.reply_text(
             "Welcome! Choose Video or Image Edit, then send me a photo.\n"
-            "Image Edit uses the prompt in your photo caption; Video uses its configured animation prompt.\n"
-            "You have one free generation. After that, you need tokens. Use /buy.\n"
+            "Image Edit uses the prompt in your photo caption and includes one free generation. Video uses its configured animation prompt and requires paid tokens from the first request.\n"
+            "Use /buy to purchase tokens. Video costs more because it uses more compute.\n"
             "You can change the mode any time with /mode, check /balance, or use the Support and Language buttons.",
             reply_markup=ReplyKeyboardMarkup(
                 MODE_KEYBOARD,
@@ -101,7 +101,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "Choose 🎬 Video or 🖼️ Image Edit before sending a photo.\n"
             "You can also use /mode video or /mode image_edit.\n"
-            "Image Edit uses the prompt in your photo caption; Video uses its configured animation prompt."
+            "Image Edit includes one free generation and uses the prompt in your photo caption. Video requires paid tokens from the first request and costs more because it uses more compute."
         )
 
 
@@ -201,7 +201,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(
         f"{format_balance_summary(balance)}\n"
         f"Paid tokens: {balance['balance']}.\n"
-        f"Free generation: {free_status}.\n"
+        f"Free Image Edit generation: {free_status}.\n"
         f"Generation history ({balance['generation_count']} total):\n{history_text}"
     )
 
@@ -331,7 +331,7 @@ async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     context.chat_data["generation_mode"] = selected_mode
     logger.info("Selected generation mode: %s", selected_mode)
     await update.message.reply_text(
-        f"Mode set to {selected_mode}. Send a photo when ready.\n"
+        f"Mode set to {selected_mode}. Send a photo when ready. Cost: {mode_cost(selected_mode)} token(s).\n"
         f"{mode_instruction(selected_mode)}",
         reply_markup=ReplyKeyboardMarkup(
             MODE_KEYBOARD,
@@ -364,14 +364,14 @@ async def select_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not selected_mode:
         await update.message.reply_text(
             "Choose 🎬 Video or 🖼️ Image Edit, then send a photo.\n"
-            "Image Edit uses the prompt in your photo caption; Video uses its configured animation prompt."
+            "Image Edit includes one free generation; Video requires paid tokens from the first request."
         )
         return
 
     context.chat_data["generation_mode"] = selected_mode
     logger.info("Selected generation mode: %s", selected_mode)
     await update.message.reply_text(
-        f"Mode set to {selected_mode}. Send a photo when ready.\n"
+        f"Mode set to {selected_mode}. Send a photo when ready. Cost: {mode_cost(selected_mode)} token(s).\n"
         f"{mode_instruction(selected_mode)}",
         reply_markup=ReplyKeyboardMarkup(
             MODE_KEYBOARD,
@@ -625,23 +625,31 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     reservation = None
     if user_id is not None:
         prompt = _get_image_prompt(update) if mode == IMAGE_EDIT_MODE else os.getenv("HF_PROMPT", DEFAULT_PROMPT)
-        reservation = wallet_store.reserve_generation(user_id, mode=mode, prompt=prompt)
+        cost = mode_cost(mode)
+        reservation = wallet_store.reserve_generation(
+            user_id,
+            mode=mode,
+            prompt=prompt,
+            cost=cost,
+            allow_free=mode == IMAGE_EDIT_MODE,
+        )
         if reservation is None:
             balance = wallet_store.get_balance(user_id)
             logger.info("Generation blocked: user_id=%s balance=%s", user_id, balance["balance"])
             await update.message.reply_text(
-                "Balance is zero. Buy 10, 30, or 75 tokens with /buy.",
+                f"You need {cost} paid token(s) for {mode}. Your current balance is {balance['balance']}. Buy 10, 30, or 75 tokens with /buy.",
                 reply_markup=_buy_keyboard(),
             )
             return
         logger.info(
-            "Generation reserved: user_id=%s kind=%s balance=%s",
+            "Generation reserved: user_id=%s kind=%s cost=%s balance=%s",
             user_id,
             reservation["kind"],
+            reservation["cost"],
             reservation["balance"],
         )
         if reservation["kind"] == "free":
-            await update.message.reply_text("This request uses your free generation.")
+            await update.message.reply_text("This Image Edit request uses your free generation.")
 
     await update.message.reply_text("Processing…")
 
@@ -691,7 +699,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                         reservation["reservation_id"],
                         balance["balance"],
                     )
-                    await update.message.reply_text(format_balance_summary(balance))
+                    await update.message.reply_text(format_balance_summary(balance, mode))
     except asyncio.TimeoutError:
         if reservation and user_id is not None:
             balance = wallet_store.refund_generation(user_id, reservation, mode=mode, error="timeout")
@@ -699,7 +707,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.error("Hugging Face Space timed out")
         await update.message.reply_text(
             "The generation timed out. Your credit was restored. "
-            f"{format_balance_summary(balance) if reservation and user_id is not None else ''}"
+            f"{format_balance_summary(balance, mode) if reservation and user_id is not None else ''}"
         )
     except Exception:
         if reservation and user_id is not None:
@@ -708,7 +716,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.error("Photo generation failed")
         await update.message.reply_text(
             "I couldn't generate this time. Your credit was restored. "
-            f"{format_balance_summary(balance) if reservation and user_id is not None else ''}"
+            f"{format_balance_summary(balance, mode) if reservation and user_id is not None else ''}"
         )
 
 

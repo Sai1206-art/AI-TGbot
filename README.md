@@ -2,7 +2,7 @@
 
 This is a very small demo bot. A user chooses Video or Image Edit, sends a photo, and receives the generated result from your Hugging Face Space.
 
-It uses polling, SQLite wallets, and Telegram Stars payments. Every user gets one free generation, then spends one token per successful request in either mode.
+It uses polling, SQLite wallets, and Telegram Stars payments. Every user gets one free Image Edit generation; Video requires paid tokens from the first request and costs three tokens by default.
 
 ## Important: protect your token
 
@@ -101,17 +101,17 @@ You should see `Bot is running`. Leave this Terminal window open while testing.
 
 ### Tokens and Telegram Stars
 
-Each Telegram user receives one free generation on their first Video or Image Edit request. Later requests cost one token. After a purchase and after each successful generation, the bot shows total generations remaining, including any unused free generation. Use `/balance` to see the free-credit status, paid balance, and recent history; `/history` shows up to ten recent requests; `/buy` chooses a 10-, 30-, or 75-token package paid with Telegram Stars (XTR). `/support` and `/paysupport` tell users where to request help, and `/language` records the current language selection.
+Each Telegram user receives one free Image Edit generation. Video never uses the free credit and costs three paid tokens by default; Image Edit costs one paid token after the free generation. Set `IMAGE_EDIT_COST` and `VIDEO_COST` to change the per-mode costs. After a purchase and after each successful generation, the bot shows the remaining paid balance and mode-specific affordable generations. Use `/balance` to see the free-credit status, paid balance, and recent history; `/history` shows up to ten recent requests; `/buy` chooses a 10-, 30-, or 75-token package paid with Telegram Stars (XTR). `/support` and `/paysupport` tell users where to request help, and `/language` records the current language selection.
 
-The bot approves valid pre-checkout queries, credits tokens only after Telegram sends a successful payment update, and stores the Telegram charge ID in SQLite for duplicate-payment protection. A free credit or paid token is reserved atomically before any generation, logged in `wallet_events`, and automatically refunded exactly once if the Hugging Face Space fails or times out. Successful and failed requests are stored in `generation_history`; stale reservations are recovered at startup after `RESERVATION_MAX_AGE_SECONDS`.
+The bot approves valid pre-checkout queries, credits tokens only after Telegram sends a successful payment update, and stores the Telegram charge ID in SQLite for duplicate-payment protection. The mode-specific free credit or exact paid token cost is reserved atomically before any generation, logged in `wallet_events`, and automatically refunded exactly once if the Hugging Face Space fails or times out. Successful and failed requests are stored in `generation_history`; stale reservations are recovered at startup after `RESERVATION_MAX_AGE_SECONDS`.
 
 The SQLite database defaults to `bot_data.sqlite3` in the project folder. Set `WALLET_DB_PATH` to move it. Package amounts currently use a simple 1 Star = 1 token demo price; review your GPU cost and change the package pricing before launch.
 
 Manual payment test plan:
 
-1. New user sends `/start`, selects Video or Image Edit, and sends one photo: it succeeds as the free generation.
-2. The same user sends another photo: the bot blocks it and shows the Buy Tokens menu.
-3. The user buys the 10-token package with Telegram Stars, then sends another photo: payment confirmation increases the balance and the generation deducts one token.
+1. New user sends `/start`, selects Image Edit, and sends one photo: it succeeds as the free generation.
+2. New user selects Video with zero paid balance: the bot blocks it and shows the Buy Tokens menu.
+3. The user buys the 10-token package with Telegram Stars, then sends a video photo: payment confirmation increases the balance and the generation deducts three tokens.
 
 To stop the bot, click the Terminal window and press `Control+C`.
 
