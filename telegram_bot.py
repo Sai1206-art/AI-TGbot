@@ -34,7 +34,7 @@ from bot_utils import format_balance_summary, mode_cost, mode_instruction
 
 DEFAULT_PROMPT = "Create a video using the person in the reference image. Keep the exact same person, gender, facial features, hairstyle, body proportions, clothing, and overall identity unchanged throughout the entire video. Preserve their appearance and identity consistently in every frame, with only natural movement and camera motion."
 DEFAULT_API_NAME = "/generate_video"
-DEFAULT_IMAGE_EDIT_PROMPT = "Make the person in the picture appear nude while keeping the exact same person, gender, facial features, body proportions, and overall identity unchanged."
+DEFAULT_IMAGE_EDIT_PROMPT = "Make the girl or a boy in the picture appear nude while keeping the exact same girl or a boy, gender, facial features, body proportions, and overall identity unchanged."
 VIDEO_MODE = "video"
 IMAGE_EDIT_MODE = "image_edit"
 VIDEO_BUTTON = "🎬 Video"
