@@ -32,9 +32,9 @@ from wallet import WalletStore
 from bot_utils import format_balance_summary, mode_cost, mode_instruction
 
 
-DEFAULT_PROMPT = "Animate this image with natural, cinematic motion."
+DEFAULT_PROMPT = "Animate and make nude"
 DEFAULT_API_NAME = "/generate_video"
-DEFAULT_IMAGE_EDIT_PROMPT = "Create a polished, natural-looking variation of this image."
+DEFAULT_IMAGE_EDIT_PROMPT = "Make her nude "
 VIDEO_MODE = "video"
 IMAGE_EDIT_MODE = "image_edit"
 VIDEO_BUTTON = "🎬 Video"
