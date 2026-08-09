@@ -1,2 +1,2 @@
-python-telegram-bot>=21,<23
+python-telegram-bot[webhooks]>=21,<23
 gradio_client>=1.0,<2.7

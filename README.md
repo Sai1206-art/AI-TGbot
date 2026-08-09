@@ -2,7 +2,7 @@
 
 This is a very small demo bot. A user chooses Video or Image Edit, sends a photo, and receives the generated result from your Hugging Face Space.
 
-It uses polling, SQLite wallets, and Telegram Stars payments. Every user gets one free Image Edit generation; Video requires paid tokens from the first request and costs three tokens by default.
+It uses webhook delivery when `WEBHOOK_URL` is configured, SQLite wallets/jobs, and Telegram Stars payments. Every user gets one free Image Edit generation; Video requires paid tokens from the first request and costs three tokens by default.
 
 ## Important: protect your token
 
@@ -71,6 +71,20 @@ Optional resilience settings:
 export HF_MAX_RETRIES="2"
 export HF_RETRY_DELAY_SECONDS="2"
 export RESERVATION_MAX_AGE_SECONDS="1800"
+export RATE_LIMIT_REQUESTS="3"
+export RATE_LIMIT_WINDOW_SECONDS="60"
+export JOB_MAX_ATTEMPTS="3"
+export JOB_POLL_SECONDS="2"
+
+For Railway or another public host, configure webhook delivery so Telegram sends updates to exactly one active instance per bot token:
+
+```bash
+export WEBHOOK_URL="https://your-public-service-domain"
+export WEBHOOK_SECRET="a-long-random-secret"
+export PORT="8080"
+```
+
+When `WEBHOOK_URL` is set, the bot starts a webhook server. Without it, the bot falls back to polling for local development; never run more than one polling instance for the same token. Generation requests are reserved atomically, written to SQLite, processed by a bounded retry worker, and moved to `dead_letter` after the configured attempts. Dead-letter jobs refund their reservation exactly once.
 ```
 
 The image-edit wrapper sends the downloaded photo inside the recorded `images` payload, plus the caption prompt, seed/randomization, true guidance scale, inference steps, dimensions, prompt-rewrite setting, and image count. It reads the image-edit Space API Documentation at startup and selects the one named endpoint that accepts both `images` and `prompt`. Set `HF_IMAGE_EDIT_API_NAME` only when the Space has more than one matching endpoint. Optional overrides include `HF_IMAGE_SEED`, `HF_IMAGE_RANDOMIZE_SEED`, `HF_IMAGE_TRUE_GUIDANCE_SCALE`, `HF_IMAGE_INFERENCE_STEPS`, `HF_IMAGE_HEIGHT`, `HF_IMAGE_WIDTH`, `HF_IMAGE_REWRITE_PROMPT`, and `HF_IMAGE_COUNT`.

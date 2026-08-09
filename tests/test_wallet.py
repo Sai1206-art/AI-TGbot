@@ -95,6 +95,67 @@ class WalletStoreTests(unittest.TestCase):
         self.store.refund_generation(5, reservation, mode="video", error="failure")
         self.assertEqual(self.store.get_balance(5)["balance"], 10)
 
+    def test_request_and_job_are_idempotent_with_dead_letter(self) -> None:
+        self.store.add_payment(
+            user_id=6,
+            telegram_payment_charge_id="charge-job",
+            provider_payment_charge_id=None,
+            payload="tokens:10:stars:10",
+            credits=10,
+            stars=10,
+        )
+        reservation = self.store.reserve_generation(
+            6, mode="video", cost=3, allow_free=False, request_key="photo:6:1"
+        )
+        duplicate = self.store.reserve_generation(
+            6, mode="video", cost=3, allow_free=False, request_key="photo:6:1"
+        )
+        self.assertEqual(duplicate["reservation_id"], reservation["reservation_id"])
+        job = self.store.enqueue_generation_job(
+            request_key="photo:6:1",
+            user_id=6,
+            chat_id=6,
+            message_id=1,
+            reservation_id=reservation["reservation_id"],
+            kind=reservation["kind"],
+            cost=reservation["cost"],
+            mode="video",
+            prompt="test",
+            file_id="telegram-file",
+        )
+        duplicate_job = self.store.enqueue_generation_job(
+            request_key="photo:6:1",
+            user_id=6,
+            chat_id=6,
+            message_id=1,
+            reservation_id=reservation["reservation_id"],
+            kind=reservation["kind"],
+            cost=reservation["cost"],
+            mode="video",
+            prompt="test",
+            file_id="telegram-file",
+        )
+        self.assertEqual(job["job_id"], duplicate_job["job_id"])
+        for _ in range(2):
+            claimed = self.store.claim_next_generation_job(max_attempts=3)
+            self.assertIsNotNone(claimed)
+            self.assertEqual(
+                self.store.finish_generation_job(
+                    claimed["job_id"], failed=True, error="upstream", max_attempts=3
+                ),
+                "queued",
+            )
+        claimed = self.store.claim_next_generation_job(max_attempts=3)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(
+            self.store.finish_generation_job(
+                claimed["job_id"], failed=True, error="upstream", max_attempts=3
+            ),
+            "dead_letter",
+        )
+        self.store.refund_generation(6, reservation, mode="video", error="dead-letter")
+        self.assertEqual(self.store.get_balance(6)["balance"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

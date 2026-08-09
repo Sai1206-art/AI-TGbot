@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Any
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        try:
+            super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 class WalletStore:
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
@@ -15,7 +23,9 @@ class WalletStore:
         self._initialise()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path, timeout=30)
+        connection = sqlite3.connect(
+            self.database_path, timeout=30, factory=_ClosingConnection
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 30000")
         connection.execute("PRAGMA foreign_keys = ON")
@@ -64,9 +74,32 @@ class WalletStore:
                     status TEXT NOT NULL,
                     mode TEXT,
                     prompt TEXT,
+                    request_key TEXT UNIQUE,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS generation_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    request_key TEXT NOT NULL UNIQUE,
+                    user_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    reservation_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    cost INTEGER NOT NULL,
+                    mode TEXT NOT NULL,
+                    prompt TEXT,
+                    file_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at TEXT NOT NULL,
+                    claimed_at TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS generation_jobs_ready_idx
+                    ON generation_jobs(status, available_at, created_at);
                 CREATE TABLE IF NOT EXISTS generation_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id INTEGER NOT NULL,
@@ -83,6 +116,12 @@ class WalletStore:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(generation_reservations)")}
             if "cost" not in columns:
                 connection.execute("ALTER TABLE generation_reservations ADD COLUMN cost INTEGER NOT NULL DEFAULT 1")
+            if "request_key" not in columns:
+                connection.execute("ALTER TABLE generation_reservations ADD COLUMN request_key TEXT")
+                connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS generation_reservations_request_key_idx "
+                    "ON generation_reservations(request_key) WHERE request_key IS NOT NULL"
+                )
 
     def _ensure_user_in(self, connection: sqlite3.Connection, user_id: int, timestamp: str) -> None:
         connection.execute(
@@ -168,6 +207,7 @@ class WalletStore:
         prompt: str | None = None,
         cost: int = 1,
         allow_free: bool = True,
+        request_key: str | None = None,
     ) -> dict[str, Any] | None:
         if cost < 1:
             raise ValueError("Generation cost must be at least 1 token.")
@@ -176,6 +216,24 @@ class WalletStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             self._ensure_user_in(connection, user_id, timestamp)
+            if request_key:
+                existing = connection.execute(
+                    "SELECT reservation_id, kind, cost, status FROM generation_reservations WHERE request_key = ?",
+                    (request_key,),
+                ).fetchone()
+                if existing:
+                    wallet = connection.execute(
+                        "SELECT balance, free_credit_used FROM wallets WHERE user_id = ?",
+                        (user_id,),
+                    ).fetchone()
+                    return {
+                        "reservation_id": existing["reservation_id"],
+                        "kind": existing["kind"],
+                        "cost": existing["cost"],
+                        "balance": wallet["balance"],
+                        "free_credit_used": wallet["free_credit_used"],
+                        "status": existing["status"],
+                    }
             row = connection.execute(
                 "SELECT free_credit_used, balance FROM wallets WHERE user_id = ?",
                 (user_id,),
@@ -201,10 +259,10 @@ class WalletStore:
             connection.execute(
                 """
                 INSERT INTO generation_reservations
-                    (reservation_id, user_id, kind, cost, status, mode, prompt, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?)
+                    (reservation_id, user_id, kind, cost, status, mode, prompt, request_key, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?)
                 """,
-                (reservation_id, user_id, kind, cost, mode, prompt, timestamp, timestamp),
+                (reservation_id, user_id, kind, cost, mode, prompt, request_key, timestamp, timestamp),
             )
             self._record_event(
                 connection,
@@ -223,7 +281,107 @@ class WalletStore:
             "cost": cost if kind == "paid" else 0,
             "balance": new_balance,
             "free_credit_used": free_used,
+            "status": "reserved",
         }
+
+    def enqueue_generation_job(
+        self,
+        *,
+        request_key: str,
+        user_id: int,
+        chat_id: int,
+        message_id: int,
+        reservation_id: str,
+        kind: str,
+        cost: int,
+        mode: str,
+        prompt: str,
+        file_id: str,
+    ) -> dict[str, Any]:
+        timestamp = self._timestamp()
+        job_id = uuid.uuid4().hex
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO generation_jobs
+                    (job_id, request_key, user_id, chat_id, message_id, reservation_id,
+                     kind, cost, mode, prompt, file_id, status, available_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                """,
+                (job_id, request_key, user_id, chat_id, message_id, reservation_id, kind, cost,
+                 mode, prompt, file_id, timestamp, timestamp, timestamp),
+            )
+            row = connection.execute(
+                "SELECT * FROM generation_jobs WHERE request_key = ?", (request_key,)
+            ).fetchone()
+        return dict(row)
+
+    def claim_next_generation_job(self, *, max_attempts: int = 3) -> dict[str, Any] | None:
+        timestamp = self._timestamp()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM generation_jobs
+                WHERE status = 'queued' AND attempts < ? AND available_at <= ?
+                ORDER BY created_at LIMIT 1
+                """,
+                (max_attempts, timestamp),
+            ).fetchone()
+            if not row:
+                return None
+            connection.execute(
+                """UPDATE generation_jobs
+                   SET status = 'running', attempts = attempts + 1,
+                       claimed_at = ?, updated_at = ? WHERE job_id = ?""",
+                (timestamp, timestamp, row["job_id"]),
+            )
+            row = connection.execute(
+                "SELECT * FROM generation_jobs WHERE job_id = ?", (row["job_id"],)
+            ).fetchone()
+        return dict(row)
+
+    def finish_generation_job(
+        self,
+        job_id: str,
+        *,
+        failed: bool = False,
+        error: str | None = None,
+        retry_delay_seconds: int = 0,
+        max_attempts: int = 3,
+    ) -> str:
+        timestamp = self._timestamp()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT attempts FROM generation_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if not row:
+                return "missing"
+            if not failed:
+                status = "completed"
+                available_at = timestamp
+            elif row["attempts"] >= max_attempts:
+                status = "dead_letter"
+                available_at = timestamp
+            else:
+                status = "queued"
+                available_at = (
+                    datetime.now(timezone.utc) + timedelta(seconds=retry_delay_seconds)
+                ).isoformat()
+            connection.execute(
+                """UPDATE generation_jobs
+                   SET status = ?, available_at = ?, last_error = ?, updated_at = ?
+                   WHERE job_id = ?""",
+                (status, available_at, error, timestamp, job_id),
+            )
+        return status
+
+    def get_job_counts(self) -> dict[str, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM generation_jobs GROUP BY status"
+            ).fetchall()
+        return {row["status"]: row["count"] for row in rows}
 
     def complete_generation(
         self,

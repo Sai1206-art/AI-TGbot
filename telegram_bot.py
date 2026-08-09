@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict, deque
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -46,6 +47,7 @@ MODE_KEYBOARD = [[VIDEO_BUTTON, IMAGE_EDIT_BUTTON], [BALANCE_BUTTON, SUPPORT_BUT
 PACKAGE_CREDITS = (10, 30, 75)
 WALLET_DB_PATH = os.getenv("WALLET_DB_PATH", "bot_data.sqlite3")
 wallet_store = WalletStore(WALLET_DB_PATH)
+_rate_limit_events: dict[int, deque[float]] = defaultdict(deque)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -614,62 +616,91 @@ def _get_image_prompt(update: Update) -> str:
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Download a Telegram photo, generate media, and send it back."""
+    """Reserve a generation and enqueue it for a durable worker."""
     if not update.message:
         return
 
     user_id = _ensure_user(update)
+    if user_id is None:
+        return
+    now = time.monotonic()
+    window_seconds = max(1, int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60")))
+    max_requests = max(1, int(os.getenv("RATE_LIMIT_REQUESTS", "3")))
+    events = _rate_limit_events[user_id]
+    while events and now - events[0] >= window_seconds:
+        events.popleft()
+    if len(events) >= max_requests:
+        await update.message.reply_text("You are sending requests too quickly. Please wait a moment and try again.")
+        return
+    events.append(now)
+
     mode = _mode_for_chat(context)
-    logger.info("Processing photo in %s mode", mode)
-
-    reservation = None
-    if user_id is not None:
-        prompt = _get_image_prompt(update) if mode == IMAGE_EDIT_MODE else os.getenv("HF_PROMPT", DEFAULT_PROMPT)
-        cost = mode_cost(mode)
-        reservation = wallet_store.reserve_generation(
-            user_id,
-            mode=mode,
-            prompt=prompt,
-            cost=cost,
-            allow_free=mode == IMAGE_EDIT_MODE,
+    prompt = _get_image_prompt(update) if mode == IMAGE_EDIT_MODE else os.getenv("HF_PROMPT", DEFAULT_PROMPT)
+    cost = mode_cost(mode)
+    request_key = f"photo:{update.message.chat_id}:{update.message.message_id}"
+    reservation = wallet_store.reserve_generation(
+        user_id,
+        mode=mode,
+        prompt=prompt,
+        cost=cost,
+        allow_free=mode == IMAGE_EDIT_MODE,
+        request_key=request_key,
+    )
+    if reservation is None:
+        balance = wallet_store.get_balance(user_id)
+        await update.message.reply_text(
+            f"You need {cost} paid token(s) for {mode}. Your current balance is {balance['balance']}. Buy 10, 30, or 75 tokens with /buy.",
+            reply_markup=_buy_keyboard(),
         )
-        if reservation is None:
-            balance = wallet_store.get_balance(user_id)
-            logger.info("Generation blocked: user_id=%s balance=%s", user_id, balance["balance"])
-            await update.message.reply_text(
-                f"You need {cost} paid token(s) for {mode}. Your current balance is {balance['balance']}. Buy 10, 30, or 75 tokens with /buy.",
-                reply_markup=_buy_keyboard(),
-            )
-            return
-        logger.info(
-            "Generation reserved: user_id=%s kind=%s cost=%s balance=%s",
-            user_id,
-            reservation["kind"],
-            reservation["cost"],
-            reservation["balance"],
-        )
-        if reservation["kind"] == "free":
-            await update.message.reply_text("This Image Edit request uses your free generation.")
+        return
+    if reservation["status"] != "reserved":
+        await update.message.reply_text("This photo request was already accepted and is being handled safely.")
+        return
+    job = wallet_store.enqueue_generation_job(
+        request_key=request_key,
+        user_id=user_id,
+        chat_id=update.message.chat_id,
+        message_id=update.message.message_id,
+        reservation_id=reservation["reservation_id"],
+        kind=reservation["kind"],
+        cost=reservation["cost"],
+        mode=mode,
+        prompt=prompt,
+        file_id=update.message.photo[-1].file_id,
+    )
+    if reservation["kind"] == "free" and reservation["status"] == "reserved":
+        await update.message.reply_text("This Image Edit request uses your free generation.")
+    await update.message.reply_text(
+        f"Queued for processing (job {job['job_id'][:8]}). I’ll send the result when it’s ready."
+    )
 
-    await update.message.reply_text("Processing…")
+
+async def _process_generation_job(application: Application, job: dict[str, Any]) -> None:
+    bot = application.bot
+    user_id = job["user_id"]
+    mode = job["mode"]
+    reservation = {
+        "reservation_id": job["reservation_id"],
+        "kind": job["kind"],
+        "cost": job["cost"],
+    }
 
     try:
         with TemporaryDirectory(prefix="telegram-ai-video-") as temp_dir:
             image_path = Path(temp_dir) / "input.jpg"
             video_copy = Path(temp_dir) / "generated.mp4"
-
-            largest_photo = update.message.photo[-1]
-            telegram_file = await largest_photo.get_file()
+            telegram_file = await bot.get_file(job["file_id"])
             await telegram_file.download_to_drive(custom_path=image_path)
 
             timeout_seconds = float(os.getenv("HF_TIMEOUT_SECONDS", "900"))
             if mode == IMAGE_EDIT_MODE:
                 generated_path = await asyncio.wait_for(
-                    asyncio.to_thread(_generate_image_edit, image_path, _get_image_prompt(update)),
+                    asyncio.to_thread(_generate_image_edit, image_path, job["prompt"]),
                     timeout=timeout_seconds,
                 )
                 with generated_path.open("rb") as image_file:
-                    await update.message.reply_photo(
+                    await bot.send_photo(
+                        chat_id=job["chat_id"],
                         photo=image_file,
                         caption="Here is your edited image.",
                     )
@@ -682,42 +713,58 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     video_copy.write_bytes(generated_path.read_bytes())
 
                 with video_copy.open("rb") as video_file:
-                    await update.message.reply_video(
+                    await bot.send_video(
+                        chat_id=job["chat_id"],
                         video=video_file,
                         caption="Here is your generated video.",
                     )
-            if reservation and user_id is not None:
-                completed = wallet_store.complete_generation(
-                    user_id, reservation, mode=mode, prompt=prompt
-                )
-                if completed:
-                    balance = wallet_store.get_balance(user_id)
-                    logger.info(
-                        "Generation completed: user_id=%s mode=%s reservation_id=%s balance=%s",
-                        user_id,
-                        mode,
-                        reservation["reservation_id"],
-                        balance["balance"],
-                    )
-                    await update.message.reply_text(format_balance_summary(balance, mode))
+            wallet_store.complete_generation(user_id, reservation, mode=mode, prompt=job["prompt"])
+            wallet_store.finish_generation_job(job["job_id"])
+            balance = wallet_store.get_balance(user_id)
+            await bot.send_message(chat_id=job["chat_id"], text=format_balance_summary(balance, mode))
     except asyncio.TimeoutError:
-        if reservation and user_id is not None:
+        status = wallet_store.finish_generation_job(
+            job["job_id"], failed=True, error="timeout", retry_delay_seconds=15,
+            max_attempts=int(os.getenv("JOB_MAX_ATTEMPTS", "3")),
+        )
+        if status == "dead_letter":
             balance = wallet_store.refund_generation(user_id, reservation, mode=mode, error="timeout")
-            logger.info("Generation refund: user_id=%s balance=%s", user_id, balance["balance"])
-        logger.error("Hugging Face Space timed out")
-        await update.message.reply_text(
-            "The generation timed out. Your credit was restored. "
-            f"{format_balance_summary(balance, mode) if reservation and user_id is not None else ''}"
-        )
+            await bot.send_message(chat_id=job["chat_id"], text="The generation timed out after retries. Your credit was restored. " + format_balance_summary(balance, mode))
     except Exception:
-        if reservation and user_id is not None:
-            balance = wallet_store.refund_generation(user_id, reservation, mode=mode, error="upstream failure")
-            logger.info("Generation refund: user_id=%s balance=%s", user_id, balance["balance"])
-        logger.error("Photo generation failed")
-        await update.message.reply_text(
-            "I couldn't generate this time. Your credit was restored. "
-            f"{format_balance_summary(balance, mode) if reservation and user_id is not None else ''}"
+        status = wallet_store.finish_generation_job(
+            job["job_id"], failed=True, error="upstream failure", retry_delay_seconds=15,
+            max_attempts=int(os.getenv("JOB_MAX_ATTEMPTS", "3")),
         )
+        logger.exception("Generation job failed: job_id=%s status=%s", job["job_id"], status)
+        if status == "dead_letter":
+            balance = wallet_store.refund_generation(user_id, reservation, mode=mode, error="upstream failure")
+            await bot.send_message(chat_id=job["chat_id"], text="I couldn’t complete this after retries. Your credit was restored. " + format_balance_summary(balance, mode))
+
+
+async def _generation_worker(application: Application) -> None:
+    max_attempts = max(1, int(os.getenv("JOB_MAX_ATTEMPTS", "3")))
+    poll_seconds = max(1, float(os.getenv("JOB_POLL_SECONDS", "2")))
+    while True:
+        job = await asyncio.to_thread(
+            wallet_store.claim_next_generation_job, max_attempts=max_attempts
+        )
+        if job:
+            await _process_generation_job(application, job)
+        else:
+            counts = await asyncio.to_thread(wallet_store.get_job_counts)
+            logger.info("Generation queue health: %s", counts)
+            await asyncio.sleep(poll_seconds)
+
+
+async def _post_init(application: Application) -> None:
+    application.bot_data["generation_worker"] = asyncio.create_task(_generation_worker(application))
+
+
+async def _post_shutdown(application: Application) -> None:
+    worker = application.bot_data.pop("generation_worker", None)
+    if worker:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -743,7 +790,13 @@ def main() -> None:
     if recovered:
         logger.info("Recovered stale generation reservations: count=%s", recovered)
 
-    application = Application.builder().token(token).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("mode", mode_command))
@@ -765,7 +818,21 @@ def main() -> None:
     application.add_error_handler(handle_error)
 
     print("Bot is running. Use a service manager or Docker for unattended operation.")
-    application.run_polling()
+    webhook_url = os.getenv("WEBHOOK_URL", "").strip()
+    if webhook_url:
+        secret_path = os.getenv("WEBHOOK_PATH", token[-16:])
+        secret_token = os.getenv("WEBHOOK_SECRET", "")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=int(os.getenv("PORT", "8080")),
+            url_path=secret_path,
+            webhook_url=f"{webhook_url.rstrip('/')}/{secret_path}",
+            secret_token=secret_token or None,
+            drop_pending_updates=False,
+        )
+    else:
+        logger.warning("WEBHOOK_URL is not set; falling back to polling. Use one instance per bot token.")
+        application.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
