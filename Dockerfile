@@ -7,7 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY telegram_bot.py wallet.py README.md ./
+COPY telegram_bot.py wallet.py bot_utils.py README.md ./
 RUN mkdir -p /app/data
 
 CMD ["python", "telegram_bot.py"]

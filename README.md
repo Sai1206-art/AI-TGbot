@@ -96,12 +96,12 @@ You should see `Bot is running`. Leave this Terminal window open while testing.
 1. Open your bot using the username BotFather gave you.
 2. Press **Start** or send `/start`.
 3. Choose **Video** or **Image Edit**.
-4. Send a photo. For **Image Edit**, add the edit instruction as the photo caption.
+4. For Image Edit, put your edit prompt in the photo caption; for Video, send the photo without a caption.
 5. The bot should reply `Processing…` and send the selected result.
 
 ### Tokens and Telegram Stars
 
-Each Telegram user receives one free generation on their first Video or Image Edit request. Later requests cost one token. Use `/balance` to see the free-credit status, paid balance, and recent history; `/history` shows up to ten recent requests; `/buy` chooses a 10-, 30-, or 75-token package paid with Telegram Stars (XTR). `/support` and `/paysupport` tell users where to request help, and `/language` records the current language selection.
+Each Telegram user receives one free generation on their first Video or Image Edit request. Later requests cost one token. After a purchase and after each successful generation, the bot shows total generations remaining, including any unused free generation. Use `/balance` to see the free-credit status, paid balance, and recent history; `/history` shows up to ten recent requests; `/buy` chooses a 10-, 30-, or 75-token package paid with Telegram Stars (XTR). `/support` and `/paysupport` tell users where to request help, and `/language` records the current language selection.
 
 The bot approves valid pre-checkout queries, credits tokens only after Telegram sends a successful payment update, and stores the Telegram charge ID in SQLite for duplicate-payment protection. A free credit or paid token is reserved atomically before any generation, logged in `wallet_events`, and automatically refunded exactly once if the Hugging Face Space fails or times out. Successful and failed requests are stored in `generation_history`; stale reservations are recovered at startup after `RESERVATION_MAX_AGE_SECONDS`.
 
